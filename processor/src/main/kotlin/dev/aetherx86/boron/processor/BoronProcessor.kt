@@ -1,5 +1,6 @@
 package dev.aetherx86.boron.processor
 
+import com.google.devtools.ksp.getDeclaredProperties
 import com.google.devtools.ksp.getVisibility
 import com.google.devtools.ksp.isPrivate
 import com.google.devtools.ksp.processing.CodeGenerator
@@ -14,11 +15,16 @@ import com.google.devtools.ksp.symbol.KSClassDeclaration
 import com.google.devtools.ksp.symbol.KSNode
 import com.google.devtools.ksp.symbol.KSPropertyDeclaration
 import com.google.devtools.ksp.symbol.KSType
+import com.google.devtools.ksp.symbol.KSTypeAlias
 import com.google.devtools.ksp.symbol.Modifier
 import com.google.devtools.ksp.symbol.Visibility
 import com.google.devtools.ksp.validate
+import com.squareup.kotlinpoet.AnnotationSpec
+import com.squareup.kotlinpoet.CHAR
 import com.squareup.kotlinpoet.ClassName
 import com.squareup.kotlinpoet.CodeBlock
+import com.squareup.kotlinpoet.DOUBLE
+import com.squareup.kotlinpoet.FLOAT
 import com.squareup.kotlinpoet.FileSpec
 import com.squareup.kotlinpoet.FunSpec
 import com.squareup.kotlinpoet.INT
@@ -84,7 +90,10 @@ class BoronProcessor(
     }
 
     /** A problem in user code, reported at the place that caused it. */
-    private class Rejected(message: String, val node: KSNode) : Exception(message)
+    private open class Rejected(message: String, val node: KSNode) : Exception(message)
+
+    /** A `@Bitpack` class that contains itself, directly or through other `@Bitpack` classes. */
+    private class Cycle(message: String, node: KSNode) : Rejected(message, node)
 
     private fun KSClassDeclaration.generatedVisibility(): KModifier {
         var current: KSClassDeclaration? = this
@@ -108,8 +117,24 @@ class BoronProcessor(
     private fun KSClassDeclaration.flatName(): String =
         toClassName().simpleNames.joinToString("_")
 
-    private fun KSPropertyDeclaration.hasAnnotation(name: String): Boolean =
+    private fun KSAnnotated.hasAnnotation(name: String): Boolean =
         annotations.any { it.annotationType.resolve().declaration.qualifiedName?.asString() == name }
+
+    /**
+     * Follows type aliases to the type they stand for. `typealias Celsius = Double` must compare
+     * like a `Double`, and a nullable use of an alias stays nullable.
+     */
+    private fun KSType.expanded(): KSType {
+        var type = this
+        var nullable = isMarkedNullable
+        var steps = 0
+        while (steps++ < 64) {
+            val alias = type.declaration as? KSTypeAlias ?: break
+            type = alias.type.resolve()
+            nullable = nullable || type.isMarkedNullable
+        }
+        return if (nullable) type.makeNullable() else type
+    }
 
     /**
      * The properties in declaration order. For a class with a primary constructor, an annotation
@@ -157,6 +182,30 @@ class BoronProcessor(
                 )
             }
         }
+        val flat = declaration.flatName()
+        // Two properties can map to one constant name, for example `fooBar` and `foo_bar`, and a
+        // property called `all` maps to the reserved `ALL`. Either would otherwise surface as a
+        // redeclaration error inside the generated file.
+        val constantOwners = HashMap<String, String>()
+        for (property in properties) {
+            val name = property.simpleName.asString()
+            val constant = screamingCase(name)
+            if (constant == "ALL") {
+                throw Rejected(
+                    "property $name would generate the constant ${flat}Diff.ALL, which is reserved " +
+                        "for the mask of every property. Rename it or annotate it with @DiffIgnore",
+                    property,
+                )
+            }
+            val previous = constantOwners.put(constant, name)
+            if (previous != null) {
+                throw Rejected(
+                    "properties $previous and $name both generate the constant ${flat}Diff.$constant. " +
+                        "Rename one of them or annotate it with @DiffIgnore",
+                    property,
+                )
+            }
+        }
 
         val resolver = declaration.typeParameters.toTypeParameterResolver()
         val typeVariables = declaration.typeParameters.map { it.toTypeVariableName(resolver) }
@@ -170,7 +219,6 @@ class BoronProcessor(
         val maskType = if (properties.size <= 32) INT else LONG
         val one = if (maskType == INT) "1" else "1L"
         val zero = if (maskType == INT) "0" else "0L"
-        val flat = declaration.flatName()
         val file = declaration.containingFile
         val packageName = declaration.packageName.asString()
 
@@ -221,6 +269,19 @@ class BoronProcessor(
             .returns(maskType)
             .addKdoc("Returns a mask with one bit set for each property that differs from [other].\n")
             .addStatement("var mask = %L", zero)
+        // Unsigned arrays and `contentEquals` on them are marked experimental. The user's class
+        // already opted in to declare such a property, so the generated functions opt in as well.
+        val optIn = if (properties.any { property ->
+                property.type.resolve().expanded().declaration.qualifiedName?.asString() in UNSIGNED_ARRAY_TYPES
+            }
+        ) {
+            AnnotationSpec.builder(ClassName("kotlin", "OptIn"))
+                .addMember("%T::class", ClassName("kotlin", "ExperimentalUnsignedTypes"))
+                .build()
+        } else {
+            null
+        }
+        optIn?.let { diff.addAnnotation(it) }
         for ((i, property) in properties.withIndex()) {
             diff.beginControlFlow("if·(%L)", differs(property))
             diff.addStatement("mask·=·mask·or·(%L·shl·%L)", one, i)
@@ -246,6 +307,7 @@ class BoronProcessor(
                 .returns(selfType)
                 .addKdoc("Returns a copy holding [other]'s value for each property set in [mask].\n")
                 .addCode("return copy(\n")
+            optIn?.let { apply.addAnnotation(it) }
             for (property in copyable) {
                 val i = properties.indexOf(property)
                 val name = property.simpleName.asString()
@@ -269,7 +331,7 @@ class BoronProcessor(
     /** Builds the expression deciding whether one property differs between `this` and `other`. */
     private fun differs(property: KSPropertyDeclaration): CodeBlock {
         val name = property.simpleName.asString()
-        val type = property.type.resolve()
+        val type = property.type.resolve().expanded()
         val qualified = type.declaration.qualifiedName?.asString()
         return when {
             // `!=` on a statically typed Double is IEEE comparison, where NaN differs from
@@ -281,7 +343,13 @@ class BoronProcessor(
             // nothing.
             qualified == "kotlin.Double" || qualified == "kotlin.Float" ->
                 CodeBlock.of("!%T.equals(this.%N,·other.%N)", ClassName("java.util", "Objects"), name, name)
-            qualified != null && qualified in ARRAY_TYPES ->
+            // An `Array` can hold other arrays, and `contentEquals` would compare those by
+            // identity. `contentDeepEquals` recurses into them and costs the same for flat arrays.
+            qualified == "kotlin.Array" ->
+                CodeBlock.of("!(this.%N·contentDeepEquals·other.%N)", name, name)
+            // Unsigned arrays are value classes whose `equals` compares the backing array by
+            // identity, so two arrays with equal contents would count as a change.
+            qualified != null && (qualified in ARRAY_TYPES || qualified in UNSIGNED_ARRAY_TYPES) ->
                 CodeBlock.of("!(this.%N·contentEquals·other.%N)", name, name)
             else -> CodeBlock.of("this.%N·!=·other.%N", name, name)
         }
@@ -296,34 +364,76 @@ class BoronProcessor(
 
     // ---- Bitpack ----
 
-    private enum class Kind(val typeWidth: Int) {
-        BOOLEAN(1), BYTE(8), SHORT(16), INT(32), LONG(64), ENUM(32)
+    private enum class Kind(val typeWidth: Int, val description: String) {
+        BOOLEAN(1, "Boolean"),
+        BYTE(8, "Byte"),
+        SHORT(16, "Short"),
+        INT(32, "Int"),
+        LONG(64, "Long"),
+        CHAR(16, "Char"),
+        UBYTE(8, "UByte"),
+        USHORT(16, "UShort"),
+        UINT(32, "UInt"),
+        ULONG(64, "ULong"),
+        FLOAT(32, "Float"),
+        DOUBLE(64, "Double"),
+        ENUM(32, "enum"),
+        NESTED(64, "@Bitpack class"),
+        ;
+
+        /** Whole-number kinds. Their width must be stated, and values are range checked. */
+        val integral: Boolean
+            get() = when (this) {
+                BYTE, SHORT, INT, LONG, CHAR, UBYTE, USHORT, UINT, ULONG -> true
+                else -> false
+            }
+
+        /** Kinds with negative values, which may be stored as two's complement. */
+        val signable: Boolean get() = this == BYTE || this == SHORT || this == INT || this == LONG
     }
 
     private class Field(
         val name: String,
+        /** The type as declared, which may be nullable for an enum. */
         val typeName: TypeName,
         val kind: Kind,
         val bits: Int,
         val signed: Boolean,
         val offset: Int,
-        val enumEntries: Int,
+        /** A nullable enum stores null as 0 and each entry as its ordinal plus one. */
+        val nullable: Boolean,
+        /** For [Kind.NESTED], the generated value class of the nested type. */
+        val packedType: ClassName?,
+        /** For [Kind.NESTED], whether the nested type's generated code is internal. */
+        val nestedInternal: Boolean,
+        val node: KSNode,
     ) {
         val mask: String get() = if (bits == 64) "-1L" else "0x%XL".format((1L shl bits) - 1)
+        val valueTypeName: TypeName get() = typeName.copy(nullable = false)
+        val setterName: String get() = "with" + name.replaceFirstChar { it.uppercaseChar() }
+        val packedGetterName: String get() = name + "Packed"
     }
 
     private fun kindOf(type: KSType): Kind? {
-        if (type.isMarkedNullable) return null
         val declaration = type.declaration
         if (declaration is KSClassDeclaration && declaration.classKind == ClassKind.ENUM_CLASS) {
             return Kind.ENUM
         }
+        if (type.isMarkedNullable) return null
+        if (declaration is KSClassDeclaration && declaration.hasAnnotation(BITPACK)) return Kind.NESTED
         return when (declaration.qualifiedName?.asString()) {
             "kotlin.Boolean" -> Kind.BOOLEAN
             "kotlin.Byte" -> Kind.BYTE
             "kotlin.Short" -> Kind.SHORT
             "kotlin.Int" -> Kind.INT
             "kotlin.Long" -> Kind.LONG
+            "kotlin.Char" -> Kind.CHAR
+            "kotlin.UByte" -> Kind.UBYTE
+            "kotlin.UShort" -> Kind.USHORT
+            "kotlin.UInt" -> Kind.UINT
+            "kotlin.ULong" -> Kind.ULONG
+            "kotlin.Float" -> Kind.FLOAT
+            "kotlin.Double" -> Kind.DOUBLE
             else -> null
         }
     }
@@ -331,9 +441,36 @@ class BoronProcessor(
     private fun bitsNeeded(entries: Int): Int =
         if (entries <= 1) 1 else 32 - Integer.numberOfLeadingZeros(entries - 1)
 
-    private fun readFields(declaration: KSClassDeclaration): List<Field> {
+    private fun KSClassDeclaration.qualifiedOrSimpleName(): String =
+        qualifiedName?.asString() ?: simpleName.asString()
+
+    /**
+     * Works out the bit layout of a `@Bitpack` class. [path] holds the classes that contain this
+     * one, outermost first, so that a class containing itself is reported instead of recursing
+     * forever.
+     */
+    private fun layoutOf(
+        declaration: KSClassDeclaration,
+        path: List<KSClassDeclaration> = emptyList(),
+    ): List<Field> {
+        if (declaration.classKind != ClassKind.CLASS) {
+            throw Rejected("@Bitpack only applies to classes", declaration)
+        }
+        if (declaration.typeParameters.isNotEmpty()) {
+            throw Rejected("@Bitpack does not support generic classes", declaration)
+        }
+        val className = declaration.simpleName.asString()
         val constructor = declaration.primaryConstructor
             ?: throw Rejected("@Bitpack needs a primary constructor", declaration)
+        val constructorVisibility = constructor.getVisibility()
+        if (constructorVisibility == Visibility.PRIVATE || constructorVisibility == Visibility.PROTECTED) {
+            throw Rejected(
+                "@Bitpack needs a primary constructor that generated code can call, so that unpack() " +
+                    "can rebuild the value, but the constructor of $className is " +
+                    constructorVisibility.name.lowercase(),
+                constructor,
+            )
+        }
         val fields = ArrayList<Field>()
         var offset = 0
         for (parameter in constructor.parameters) {
@@ -345,10 +482,20 @@ class BoronProcessor(
                     parameter,
                 )
             }
-            val type = parameter.type.resolve()
+            val property = declaration.getDeclaredProperties().firstOrNull { it.simpleName.asString() == name }
+            val propertyVisibility = property?.getVisibility()
+            if (propertyVisibility == Visibility.PRIVATE || propertyVisibility == Visibility.PROTECTED) {
+                throw Rejected(
+                    "generated code cannot read the ${propertyVisibility.name.lowercase()} property " +
+                        "$name of $className. @Bitpack properties must be public or internal",
+                    parameter,
+                )
+            }
+            val type = parameter.type.resolve().expanded()
             val kind = kindOf(type) ?: throw Rejected(
                 "@Bitpack property $name has the unsupported type $type. Supported types are " +
-                    "Boolean, Byte, Short, Int, Long and enum classes, none of them nullable",
+                    "Boolean, Byte, Short, Int, Long, Char, UByte, UShort, UInt, ULong, Float, Double, " +
+                    "enum classes, which may be nullable, and other @Bitpack classes from this module",
                 parameter,
             )
             val annotation = parameter.annotations.firstOrNull {
@@ -357,6 +504,7 @@ class BoronProcessor(
             val requested = annotation?.arguments?.firstOrNull { it.name?.asString() == "value" }?.value as? Int
             val signed = annotation?.arguments?.firstOrNull { it.name?.asString() == "signed" }?.value as? Boolean
                 ?: false
+            val nullable = kind == Kind.ENUM && type.isMarkedNullable
 
             val enumEntries = if (kind == Kind.ENUM) {
                 (type.declaration as KSClassDeclaration).declarations
@@ -364,9 +512,47 @@ class BoronProcessor(
             } else {
                 0
             }
+            // A nullable enum needs one more code than it has entries, for null.
+            val enumCodes = if (nullable) enumEntries + 1 else enumEntries
+
+            var packedType: ClassName? = null
+            var nestedBits = 0
+            var nestedInternal = false
+            if (kind == Kind.NESTED) {
+                val inner = type.declaration as KSClassDeclaration
+                val chain = path + declaration
+                val innerName = inner.qualifiedOrSimpleName()
+                val start = chain.indexOfFirst { it.qualifiedOrSimpleName() == innerName }
+                if (start >= 0) {
+                    val loop = (chain.drop(start) + inner).joinToString(" -> ") { it.simpleName.asString() }
+                    throw Cycle(
+                        "@Bitpack property $name makes ${inner.simpleName.asString()} contain itself " +
+                            "($loop), so it has no finite width",
+                        parameter,
+                    )
+                }
+                val innerFields = try {
+                    nestedInternal = inner.generatedVisibility() == KModifier.INTERNAL
+                    layoutOf(inner, chain)
+                } catch (e: Cycle) {
+                    // Reported at the outermost class's own property, where it can be fixed.
+                    throw if (path.isEmpty()) Cycle(e.message.orEmpty(), parameter) else e
+                } catch (e: Rejected) {
+                    throw Rejected(
+                        "@Bitpack property $name has the type ${inner.simpleName.asString()}, which " +
+                            "cannot be packed: ${e.message}",
+                        parameter,
+                    )
+                }
+                nestedBits = innerFields.last().let { it.offset + it.bits }
+                packedType = ClassName(inner.packageName.asString(), "Packed" + inner.flatName())
+            }
+
             val bits = requested ?: when (kind) {
                 Kind.BOOLEAN -> 1
-                Kind.ENUM -> bitsNeeded(enumEntries)
+                Kind.ENUM -> bitsNeeded(enumCodes)
+                Kind.FLOAT, Kind.DOUBLE -> kind.typeWidth
+                Kind.NESTED -> nestedBits
                 else -> throw Rejected(
                     "@Bitpack property $name needs @Bits to say how wide it is",
                     parameter,
@@ -376,23 +562,53 @@ class BoronProcessor(
             if (kind != Kind.ENUM && bits > kind.typeWidth) {
                 throw Rejected("$name is $bits bits wide, but its type only has ${kind.typeWidth}", parameter)
             }
-            if (kind == Kind.ENUM && bits < bitsNeeded(enumEntries)) {
+            if ((kind == Kind.FLOAT || kind == Kind.DOUBLE) && bits != kind.typeWidth) {
                 throw Rejected(
-                    "$name has $enumEntries enum entries, which need at least " +
-                        "${bitsNeeded(enumEntries)} bits, but it was given $bits",
+                    "$name is a ${kind.description}, which is stored as all ${kind.typeWidth} of its " +
+                        "IEEE 754 bits, but it was given $bits",
                     parameter,
                 )
             }
-            if (signed && (kind == Kind.BOOLEAN || kind == Kind.ENUM)) {
-                throw Rejected("$name cannot be signed, because its type has no negative values", parameter)
+            if (kind == Kind.ENUM && bits < bitsNeeded(enumCodes)) {
+                val what = if (nullable) "$enumEntries enum entries plus null" else "$enumEntries enum entries"
+                throw Rejected(
+                    "$name has $what, which need at least ${bitsNeeded(enumCodes)} bits, but it was given $bits",
+                    parameter,
+                )
+            }
+            if (kind == Kind.NESTED && bits < nestedBits) {
+                throw Rejected(
+                    "$name holds a packed ${type.declaration.simpleName.asString()}, which needs " +
+                        "$nestedBits bits, but it was given $bits",
+                    parameter,
+                )
+            }
+            if (signed && !kind.signable) {
+                val reason = when (kind) {
+                    Kind.FLOAT, Kind.DOUBLE -> "a ${kind.description} already keeps its sign in its IEEE 754 bits"
+                    Kind.NESTED -> "it holds a packed @Bitpack value"
+                    else -> "its type has no negative values"
+                }
+                throw Rejected("$name cannot be signed, because $reason", parameter)
             }
             fields.add(
-                Field(name, parameter.type.toTypeName(), kind, bits, signed, offset, enumEntries),
+                Field(
+                    name = name,
+                    typeName = parameter.type.toTypeName(),
+                    kind = kind,
+                    bits = bits,
+                    signed = signed,
+                    offset = offset,
+                    nullable = nullable,
+                    packedType = packedType,
+                    nestedInternal = nestedInternal,
+                    node = parameter,
+                ),
             )
             offset += bits
             if (offset > 64) {
                 throw Rejected(
-                    "@Bitpack properties of ${declaration.simpleName.asString()} need more than 64 bits",
+                    "@Bitpack properties of $className need more than 64 bits",
                     parameter,
                 )
             }
@@ -401,21 +617,40 @@ class BoronProcessor(
         return fields
     }
 
+    /** The field's bits, moved down to bit 0, as a Long. */
+    private fun extract(field: Field): CodeBlock = if (field.signed) {
+        // Moving the field to the top, then back down arithmetically, extends its sign.
+        CodeBlock.of("((raw·shl·%L)·shr·%L)", 64 - field.offset - field.bits, 64 - field.bits)
+    } else {
+        CodeBlock.of("((raw·ushr·%L)·and·%L)", field.offset, field.mask)
+    }
+
     /** The value of a field, read out of `raw`. */
     private fun readExpression(field: Field): CodeBlock {
-        val shifted = if (field.signed) {
-            // Moving the field to the top, then back down arithmetically, extends its sign.
-            CodeBlock.of("((raw·shl·%L)·shr·%L)", 64 - field.offset - field.bits, 64 - field.bits)
-        } else {
-            CodeBlock.of("((raw·ushr·%L)·and·%L)", field.offset, field.mask)
-        }
+        val shifted = extract(field)
         return when (field.kind) {
             Kind.BOOLEAN -> CodeBlock.of("%L·!=·0L", shifted)
             Kind.BYTE -> CodeBlock.of("%L.toByte()", shifted)
             Kind.SHORT -> CodeBlock.of("%L.toShort()", shifted)
             Kind.INT -> CodeBlock.of("%L.toInt()", shifted)
             Kind.LONG -> shifted
-            Kind.ENUM -> CodeBlock.of("%T.entries[%L.toInt()]", field.typeName, shifted)
+            Kind.CHAR -> CodeBlock.of("%T(%L.toInt())", CHAR, shifted)
+            Kind.UBYTE -> CodeBlock.of("%L.toUByte()", shifted)
+            Kind.USHORT -> CodeBlock.of("%L.toUShort()", shifted)
+            Kind.UINT -> CodeBlock.of("%L.toUInt()", shifted)
+            Kind.ULONG -> CodeBlock.of("%L.toULong()", shifted)
+            Kind.FLOAT -> CodeBlock.of("%T.fromBits(%L.toInt())", FLOAT, shifted)
+            Kind.DOUBLE -> CodeBlock.of("%T.fromBits(%L)", DOUBLE, shifted)
+            Kind.ENUM -> if (field.nullable) {
+                CodeBlock.of(
+                    "%L.toInt().let·{·if·(it·==·0)·null·else·%T.entries[it·-·1]·}",
+                    shifted,
+                    field.valueTypeName,
+                )
+            } else {
+                CodeBlock.of("%T.entries[%L.toInt()]", field.valueTypeName, shifted)
+            }
+            Kind.NESTED -> CodeBlock.of("%T(%L).unpack()", field.packedType!!, shifted)
         }
     }
 
@@ -423,14 +658,26 @@ class BoronProcessor(
     private fun widen(field: Field, value: String): CodeBlock = when (field.kind) {
         Kind.BOOLEAN -> CodeBlock.of("(if·(%L)·1L·else·0L)", value)
         Kind.LONG -> CodeBlock.of("%L", value)
-        Kind.ENUM -> CodeBlock.of("%L.ordinal.toLong()", value)
+        Kind.CHAR -> CodeBlock.of("%L.code.toLong()", value)
+        // Unsigned conversions to Long zero-extend, and ULong keeps its 64 bits as they are.
+        Kind.UBYTE, Kind.USHORT, Kind.UINT, Kind.ULONG -> CodeBlock.of("%L.toLong()", value)
+        // The raw bits keep NaN payloads, so a value comes back exactly as it went in.
+        Kind.FLOAT -> CodeBlock.of("%L.toRawBits().toLong()", value)
+        Kind.DOUBLE -> CodeBlock.of("%L.toRawBits()", value)
+        Kind.ENUM -> if (field.nullable) {
+            CodeBlock.of("(when·(val·v·=·%L)·{·null·->·0L;·else·->·v.ordinal·+·1L·})", value)
+        } else {
+            CodeBlock.of("%L.ordinal.toLong()", value)
+        }
+        // pack() checks the nested value against its own field widths.
+        Kind.NESTED -> CodeBlock.of("%L.pack().raw", value)
         else -> CodeBlock.of("%L.toLong()", value)
     }
 
     /** Statements that reject a value the field cannot represent. Empty if all values fit. */
     private fun rangeCheck(field: Field, value: String): CodeBlock {
         val builder = CodeBlock.builder()
-        if (field.kind == Kind.BOOLEAN || field.kind == Kind.ENUM || field.bits >= field.kind.typeWidth) {
+        if (!field.kind.integral || field.bits >= field.kind.typeWidth) {
             return builder.build()
         }
         val low: Long
@@ -442,6 +689,7 @@ class BoronProcessor(
             low = 0
             high = (1L shl field.bits) - 1
         }
+        // For a ULong, values of 2^63 and above widen to negative Longs and fail `< 0`.
         val wide = widen(field, value)
         builder.beginControlFlow("if·(%L·<·%LL·||·%L·>·%LL)", wide, low, wide, high)
         builder.addStatement(
@@ -453,21 +701,54 @@ class BoronProcessor(
         return builder.build()
     }
 
+    /**
+     * Rejects properties whose generated members would clash with each other or with `raw`, so
+     * the mistake is reported at the property instead of as a redeclaration in generated code.
+     */
+    private fun checkMemberNames(packedName: String, fields: List<Field>) {
+        val properties = HashMap<String, String>()
+        properties["raw"] = "the property that holds the packed bits"
+        val functions = HashMap<String, String>()
+        functions["unpack"] = "the function that rebuilds the value"
+        fun claim(table: HashMap<String, String>, member: String, field: Field, what: String) {
+            val previous = table.put(member, "$what of property ${field.name}")
+            if (previous != null) {
+                throw Rejected(
+                    "@Bitpack property ${field.name} would generate $packedName.$member, which clashes " +
+                        "with $previous. Rename the property",
+                    field.node,
+                )
+            }
+        }
+        for (field in fields) {
+            claim(properties, field.name, field, "the getter")
+            claim(functions, field.setterName, field, "the setter")
+            if (field.kind == Kind.NESTED) {
+                claim(properties, field.packedGetterName, field, "the packed getter")
+            }
+        }
+    }
+
     private fun generateBitpack(declaration: KSClassDeclaration) {
-        if (declaration.classKind != ClassKind.CLASS) {
-            throw Rejected("@Bitpack only applies to classes", declaration)
-        }
-        if (declaration.typeParameters.isNotEmpty()) {
-            throw Rejected("@Bitpack does not support generic classes", declaration)
-        }
+        val fields = layoutOf(declaration)
         val visibility = declaration.generatedVisibility()
-        val fields = readFields(declaration)
         val className = declaration.toClassName()
         val flat = declaration.flatName()
         val packageName = declaration.packageName.asString()
         val packedName = "Packed$flat"
         val packed = ClassName(packageName, packedName)
         val file = declaration.containingFile
+        checkMemberNames(packedName, fields)
+        if (visibility == KModifier.PUBLIC) {
+            fields.firstOrNull { it.nestedInternal }?.let { field ->
+                throw Rejected(
+                    "${declaration.simpleName.asString()} is public, but its @Bitpack property " +
+                        "${field.name} has an internal type, which public generated code cannot expose. " +
+                        "Make both public or both internal",
+                    field.node,
+                )
+            }
+        }
 
         val type = TypeSpec.classBuilder(packedName)
             .addModifiers(visibility, KModifier.VALUE)
@@ -483,7 +764,7 @@ class BoronProcessor(
                     .getter(FunSpec.getterBuilder().addCode("return %L\n", readExpression(field)).build())
                     .build(),
             )
-            val setter = FunSpec.builder("with" + field.name.replaceFirstChar { it.uppercaseChar() })
+            val setter = FunSpec.builder(field.setterName)
                 .addParameter("value", field.typeName)
                 .returns(packed)
                 .addCode(rangeCheck(field, "value"))
@@ -497,6 +778,42 @@ class BoronProcessor(
                 field.offset,
             )
             type.addFunction(setter.build())
+
+            if (field.kind == Kind.NESTED) {
+                val inner = field.packedType!!
+                // Reading the nested value as its packed form allocates nothing.
+                type.addProperty(
+                    PropertySpec.builder(field.packedGetterName, inner)
+                        .addKdoc("[%N] in its packed form, without building an object.\n", field.name)
+                        .getter(
+                            FunSpec.getterBuilder()
+                                .addCode("return %T(%L)\n", inner, extract(field))
+                                .build(),
+                        )
+                        .build(),
+                )
+                type.addFunction(
+                    FunSpec.builder(field.setterName)
+                        .addParameter("value", inner)
+                        .returns(packed)
+                        .beginControlFlow("if·(value.raw·and·(%L).inv()·!=·0L)", field.mask)
+                        .addStatement(
+                            "throw·%T(%P)",
+                            ClassName("kotlin", "IllegalArgumentException"),
+                            "${field.name} is ${field.bits} bits wide, but the packed value " +
+                                "\${value.raw} sets bits beyond it",
+                        )
+                        .endControlFlow()
+                        .addStatement(
+                            "return·%T((raw·and·(%L·shl·%L).inv())·or·(value.raw·shl·%L))",
+                            packed,
+                            field.mask,
+                            field.offset,
+                            field.offset,
+                        )
+                        .build(),
+                )
+            }
         }
 
         val unpack = FunSpec.builder("unpack")
@@ -554,6 +871,12 @@ class BoronProcessor(
             "kotlin.DoubleArray",
             "kotlin.CharArray",
             "kotlin.BooleanArray",
+        )
+        val UNSIGNED_ARRAY_TYPES = setOf(
+            "kotlin.UByteArray",
+            "kotlin.UShortArray",
+            "kotlin.UIntArray",
+            "kotlin.ULongArray",
         )
     }
 }

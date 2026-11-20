@@ -125,3 +125,79 @@ data class UsesGenerated(
     val packed: PackedParticle,
     val note: String,
 )
+
+// ---- Added in 0.2.0 ----
+
+typealias Celsius = Double
+
+typealias Samples = IntArray
+
+/** Alias types must compare like the types they stand for: NaN-safe and by contents. */
+@FastDiff
+data class Aliased(
+    val temperature: Celsius,
+    val maybe: Celsius?,
+    val samples: Samples,
+)
+
+/** `Array` compares deeply, so nested arrays compare by contents too. */
+@FastDiff
+data class Grid(
+    val cells: Array<IntArray>,
+    val layers: Array<Array<String>>,
+)
+
+@OptIn(ExperimentalUnsignedTypes::class)
+@FastDiff
+data class UnsignedBuffers(
+    val bytes: UByteArray,
+    val shorts: UShortArray,
+    val ints: UIntArray,
+    val longs: ULongArray,
+)
+
+/** Every scalar type added in 0.2.0, laid out in 64 bits exactly. */
+@Bitpack
+data class Scalars(
+    @Bits(7) val ascii: Char,
+    @Bits(3) val tiny: UByte,
+    @Bits(16) val word: UShort,
+    @Bits(5) val count: UInt,
+    @Bits(1) val bit: ULong,
+    val ratio: Float,
+)
+
+@Bitpack
+data class WholeDouble(val value: Double)
+
+@Bitpack
+data class WholeULong(@Bits(64) val value: ULong)
+
+/** Five entries plus null need three bits. */
+@Bitpack
+data class OptionalMaterial(
+    val material: Material?,
+    val single: Single?,
+    val flag: Boolean,
+)
+
+@Bitpack
+data class Position(
+    @Bits(10, signed = true) val x: Int,
+    @Bits(10, signed = true) val y: Int,
+)
+
+/** Embeds two other @Bitpack classes; [spare] reserves room for `Position` to grow. */
+@Bitpack
+data class Cell(
+    val particle: Particle,
+    @Bits(24) val spare: Position,
+    val visible: Boolean,
+)
+
+/** A third level of nesting. */
+@Bitpack
+data class Tagged(
+    val cell: Cell,
+    @Bits(4) val tag: UByte,
+)

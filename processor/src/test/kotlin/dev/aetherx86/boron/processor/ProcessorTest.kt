@@ -92,7 +92,8 @@ class ProcessorTest {
     fun bitpackRejectsUnsupportedTypes() {
         assertRejected("@Bitpack data class S(@Bits(8) val text: String)", "text", "unsupported type")
         assertRejected("@Bitpack data class N(@Bits(8) val x: Int?)", "x", "unsupported type")
-        assertRejected("@Bitpack data class F(@Bits(8) val x: Float)", "x", "unsupported type")
+        assertRejected("@Bitpack data class L(@Bits(8) val x: List<Int>)", "x", "unsupported type")
+        assertRejected("@Bitpack data class F(@Bits(32) val x: Float?)", "x", "unsupported type")
     }
 
     @Test
@@ -153,6 +154,135 @@ class ProcessorTest {
         assertAccepted("@Bitpack data class Wide($fields)")
         val diff = (0 until 64).joinToString(", ") { "val anotherQuiteLongPropertyNameNumber$it: Double" }
         assertAccepted("@FastDiff data class WideDiffInput($diff)")
+    }
+
+    @Test
+    fun fastDiffReportsConstantNameCollisionsAtTheProperty() {
+        assertRejected(
+            "@FastDiff data class C(val fooBar: Int, val foo_bar: Int)",
+            "properties fooBar and foo_bar",
+            "CDiff.FOO_BAR",
+        )
+        assertRejected("@FastDiff data class C(val all: Int, val x: Int)", "property all", "CDiff.ALL", "reserved")
+        assertAccepted("@FastDiff data class C(val fooBar: Int, @DiffIgnore val foo_bar: Int)")
+        assertAccepted("@FastDiff data class C(@DiffIgnore val all: Int, val x: Int)")
+    }
+
+    @Test
+    fun fastDiffAcceptsAliasesAndUnsignedArrays() {
+        assertAccepted("typealias Celsius = Double\n@FastDiff data class A(val t: Celsius, val u: Celsius?)")
+        assertAccepted(
+            "@OptIn(ExperimentalUnsignedTypes::class) @FastDiff data class U(val a: UIntArray, val b: Array<IntArray>)",
+        )
+    }
+
+    @Test
+    fun bitpackAcceptsTheNewScalarTypes() {
+        assertAccepted(
+            "@Bitpack data class S(@Bits(7) val c: Char, @Bits(8) val a: UByte, @Bits(16) val b: UShort, " +
+                "@Bits(1) val d: UInt, val f: Float)",
+        )
+        assertAccepted("@Bitpack data class D(val d: Double)")
+        assertAccepted("@Bitpack data class L(@Bits(64) val d: ULong)")
+        assertAccepted("enum class E { A, B, C }\n@Bitpack data class N(val e: E?, val f: Boolean)")
+        assertAccepted("typealias Code = Int\n@Bitpack data class T(@Bits(4) val c: Code)")
+    }
+
+    @Test
+    fun bitpackChecksTheNewScalarTypes() {
+        assertRejected("@Bitpack data class W(val c: Char)", "c", "needs @Bits")
+        assertRejected("@Bitpack data class W(val u: UInt)", "u", "needs @Bits")
+        assertRejected("@Bitpack data class W(@Bits(17) val c: Char)", "17 bits", "only has 16")
+        assertRejected("@Bitpack data class W(@Bits(9) val u: UByte)", "9 bits", "only has 8")
+        assertRejected("@Bitpack data class W(@Bits(16) val f: Float)", "f is a Float", "IEEE 754", "given 16")
+        assertRejected("@Bitpack data class W(@Bits(32) val d: Double)", "d is a Double", "given 32")
+        assertRejected("@Bitpack data class W(@Bits(33) val f: Float)", "33 bits", "only has 32")
+        assertRejected("@Bitpack data class W(@Bits(4, signed = true) val u: UInt)", "cannot be signed", "no negative")
+        assertRejected("@Bitpack data class W(@Bits(4, signed = true) val c: Char)", "cannot be signed")
+        assertRejected("@Bitpack data class W(@Bits(32, signed = true) val f: Float)", "cannot be signed", "IEEE 754")
+        assertRejected("@Bitpack data class W(@Bits(8) val c: Char?)", "unsupported type")
+    }
+
+    @Test
+    fun nullableEnumsNeedRoomForNull() {
+        val colors = "enum class Color { RED, GREEN, BLUE, ALPHA }\n"
+        assertAccepted(colors + "@Bitpack data class C(@Bits(2) val color: Color)")
+        assertAccepted(colors + "@Bitpack data class C(@Bits(3) val color: Color?)")
+        assertRejected(
+            colors + "@Bitpack data class C(@Bits(2) val color: Color?)",
+            "4 enum entries plus null",
+            "at least 3",
+        )
+    }
+
+    @Test
+    fun bitpackRejectsMembersGeneratedCodeCannotReach() {
+        assertRejected("@Bitpack data class P(@Bits(3) private val x: Int)", "private property x", "public or internal")
+        assertRejected("@Bitpack class P(@Bits(3) protected val x: Int)", "protected property x")
+        assertRejected(
+            "@Bitpack data class P private constructor(@Bits(3) val x: Int)",
+            "constructor of P is private",
+            "unpack()",
+        )
+        assertAccepted("@Bitpack data class P internal constructor(@Bits(3) internal val x: Int)")
+    }
+
+    @Test
+    fun bitpackReportsGeneratedNameClashesAtTheProperty() {
+        assertRejected("@Bitpack data class R(@Bits(3) val raw: Int)", "property raw", "PackedR.raw", "packed bits")
+        assertRejected(
+            "@Bitpack data class W(@Bits(3) val x: Int, @Bits(3) val X: Int)",
+            "property X",
+            "PackedW.withX",
+            "setter of property x",
+        )
+        assertRejected(
+            "@Bitpack data class In(val f: Boolean)\n@Bitpack data class Out(val inner: In, val innerPacked: Boolean)",
+            "property innerPacked",
+            "PackedOut.innerPacked",
+            "packed getter of property inner",
+        )
+    }
+
+    @Test
+    fun bitpackNestsOtherBitpackClasses() {
+        val inner = "@Bitpack data class In(@Bits(3) val x: Int, val f: Boolean)\n"
+        assertAccepted(inner + "@Bitpack data class Out(val a: In, @Bits(10) val b: In, val c: Boolean)")
+        assertAccepted(inner + "@Bitpack data class Mid(val a: In)\n@Bitpack data class Top(val m: Mid, val n: In)")
+        assertRejected(inner + "@Bitpack data class Out(@Bits(3) val a: In)", "a holds a packed In", "needs 4 bits")
+        assertRejected(inner + "@Bitpack data class Out(@Bits(4, signed = true) val a: In)", "cannot be signed")
+        assertRejected(inner + "@Bitpack data class Out(val a: In?)", "unsupported type")
+        assertRejected(
+            "@Bitpack data class In(@Bits(40) val x: Long)\n@Bitpack data class Out(val a: In, @Bits(30) val y: Int)",
+            "more than 64 bits",
+        )
+        // A class without @Bitpack is not packable, however simple.
+        assertRejected("data class Plain(val f: Boolean)\n@Bitpack data class Out(val p: Plain)", "unsupported type")
+    }
+
+    @Test
+    fun bitpackExplainsWhyANestedClassCannotBePacked() {
+        assertRejected(
+            "@Bitpack data class In(val x: Int)\n@Bitpack data class Out(val inner: In)",
+            "property inner has the type In, which cannot be packed",
+            "needs @Bits",
+        )
+        assertRejected(
+            "@Bitpack internal data class In(val f: Boolean)\n@Bitpack data class Out(val inner: In)",
+            "Out is public",
+            "inner has an internal type",
+        )
+        assertAccepted("@Bitpack internal data class In(val f: Boolean)\n@Bitpack internal data class Out(val inner: In)")
+    }
+
+    @Test
+    fun bitpackRejectsClassesThatContainThemselves() {
+        assertRejected("@Bitpack data class A(val a: A)", "contain itself", "A -> A")
+        assertRejected(
+            "@Bitpack data class A(val b: B)\n@Bitpack data class B(val a: A)",
+            "(A -> B -> A)",
+            "(B -> A -> B)",
+        )
     }
 
     @Test

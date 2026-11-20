@@ -19,8 +19,11 @@ public annotation class FastDiff
  * property, plus `Flags.pack()` and `PackedFlags.unpack()`. A `PackedFlags` is a plain `long` at
  * run time, so arrays of them need no objects.
  *
- * Supported property types are `Boolean`, `Byte`, `Short`, `Int`, `Long` and enum classes. The
- * total width cannot exceed 64 bits.
+ * Supported property types are `Boolean`, `Byte`, `Short`, `Int`, `Long`, `Char`, `UByte`,
+ * `UShort`, `UInt`, `ULong`, `Float`, `Double`, enum classes (which may be nullable), and other
+ * `@Bitpack` classes from the same module, which are embedded as their packed bits. A nested
+ * property `inner` also gets an `innerPacked` getter and a `withInner` overload taking the packed
+ * form, neither of which builds an object. The total width cannot exceed 64 bits.
  */
 @Target(AnnotationTarget.CLASS)
 @Retention(AnnotationRetention.SOURCE)
@@ -29,9 +32,12 @@ public annotation class Bitpack
 /**
  * The width of a [Bitpack] property, in bits.
  *
- * Required for integer properties. `Boolean` defaults to one bit, and an enum defaults to the
- * fewest bits that hold all of its entries. With [signed], a property uses two's complement and
- * can hold negative values.
+ * Required for integer and `Char` properties, signed or unsigned. `Boolean` defaults to one bit,
+ * and an enum defaults to the fewest bits that hold all of its entries, plus one code for null when
+ * it is nullable. `Float` and `Double` always use all 32 or 64 of their IEEE 754 bits. A nested
+ * `@Bitpack` class defaults to its own width and may be given more, to leave room to grow. With
+ * [signed], a `Byte`, `Short`, `Int` or `Long` property uses two's complement and can hold negative
+ * values.
  */
 @Target(AnnotationTarget.PROPERTY, AnnotationTarget.VALUE_PARAMETER)
 @Retention(AnnotationRetention.SOURCE)
