@@ -16,7 +16,7 @@ kotlin {
 }
 
 dependencies {
-    implementation("com.google.devtools.ksp:symbol-processing-api:2.3.13")
+    implementation("com.google.devtools.ksp:symbol-processing-api:2.3.14")
     implementation("com.squareup:kotlinpoet:2.4.0")
     implementation("com.squareup:kotlinpoet-ksp:2.4.0")
     testImplementation(kotlin("test"))
